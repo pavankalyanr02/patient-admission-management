@@ -18,3 +18,9 @@ frontend/dist/
 # Editor and OS
 .vscode/
 .DS_Store
+
+# Python environment files
+.python-version
+
+# Logs
+*.log
