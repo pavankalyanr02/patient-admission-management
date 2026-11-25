@@ -1,13 +1,28 @@
 
-import sqlite3
+import os
 import re
 from datetime import date
 from pathlib import Path
 from typing import Optional, Literal
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator
+
+from sqlalchemy import (
+    create_engine,
+    MetaData,
+    Table,
+    Column,
+    Integer,
+    String,
+    Date,
+    select,
+    insert,
+    update,
+    delete,
+    text
+)
 
 
 # --------------------------------
@@ -20,9 +35,17 @@ app = FastAPI(
     version="1.0.0"
 )
 
+frontend_url = os.getenv("FRONTEND_URL", "")
+
+allowed_origins = ["http://localhost:5173"]
+
+if frontend_url:
+    allowed_origins.append(frontend_url.rstrip("/"))
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=allowed_origins,
+    allow_origin_regex=r"https://.*\.vercel\.app",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"]
@@ -33,39 +56,60 @@ app.add_middleware(
 # 2. DATABASE CONFIGURATION
 # --------------------------------
 
-DATABASE = Path(__file__).resolve().parent / "patients.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    # Render PostgreSQL connection
+    # Convert Render's URL to the psycopg 3 SQLAlchemy driver.
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = DATABASE_URL.replace(
+            "postgres://",
+            "postgresql+psycopg://",
+            1
+        )
+    elif DATABASE_URL.startswith("postgresql://"):
+        DATABASE_URL = DATABASE_URL.replace(
+            "postgresql://",
+            "postgresql+psycopg://",
+            1
+        )
+
+    engine = create_engine(
+        DATABASE_URL,
+        pool_pre_ping=True
+    )
+
+else:
+    # Local SQLite database for development
+    DATABASE = Path(__file__).resolve().parent / "patients.db"
+
+    engine = create_engine(
+        f"sqlite:///{DATABASE}",
+        connect_args={"check_same_thread": False}
+    )
 
 
-def get_connection():
-    connection = sqlite3.connect(DATABASE)
-    connection.row_factory = sqlite3.Row
-    return connection
+metadata = MetaData()
+
+patients = Table(
+    "patients",
+    metadata,
+
+    Column("id", Integer, primary_key=True, autoincrement=True),
+
+    Column("name", String(80), nullable=False),
+    Column("age", Integer, nullable=False),
+    Column("gender", String(20), nullable=False),
+    Column("ward", String(50), nullable=False),
+    Column("department", String(80), nullable=False),
+    Column("doctor", String(100), nullable=False),
+    Column("admission_date", Date, nullable=False),
+    Column("status", String(20), nullable=False, default="Admitted")
+)
 
 
 def create_table():
-
-    connection = get_connection()
-
-    connection.execute("""
-        CREATE TABLE IF NOT EXISTS patients (
-
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-
-            name TEXT NOT NULL,
-            age INTEGER NOT NULL,
-            gender TEXT NOT NULL,
-            ward TEXT NOT NULL,
-            department TEXT NOT NULL,
-            doctor TEXT NOT NULL,
-            admission_date TEXT NOT NULL,
-
-            status TEXT NOT NULL DEFAULT 'Admitted'
-
-        )
-    """)
-
-    connection.commit()
-    connection.close()
+    metadata.create_all(engine)
 
 
 create_table()
@@ -123,7 +167,6 @@ class Patient(BaseModel):
 
     status: Literal["Admitted", "Discharged"] = "Admitted"
 
-
     @field_validator("name")
     @classmethod
     def validate_name(cls, value):
@@ -135,7 +178,6 @@ class Patient(BaseModel):
 
         return value.strip()
 
-
     @field_validator("gender")
     @classmethod
     def validate_gender(cls, value):
@@ -144,7 +186,6 @@ class Patient(BaseModel):
             raise ValueError("Invalid gender selected")
 
         return value
-
 
     @field_validator("ward")
     @classmethod
@@ -155,7 +196,6 @@ class Patient(BaseModel):
 
         return value
 
-
     @field_validator("department")
     @classmethod
     def validate_department(cls, value):
@@ -165,7 +205,6 @@ class Patient(BaseModel):
 
         return value
 
-
     @field_validator("doctor")
     @classmethod
     def validate_doctor(cls, value):
@@ -174,7 +213,6 @@ class Patient(BaseModel):
             raise ValueError("Invalid doctor selected")
 
         return value
-
 
     @field_validator("admission_date")
     @classmethod
@@ -189,7 +227,23 @@ class Patient(BaseModel):
 
 
 # --------------------------------
-# 5. HOME AND HEALTH ROUTES
+# 5. HELPER FUNCTION
+# --------------------------------
+
+def serialize_patient(row):
+
+    patient = dict(row)
+
+    if isinstance(patient.get("admission_date"), date):
+        patient["admission_date"] = (
+            patient["admission_date"].isoformat()
+        )
+
+    return patient
+
+
+# --------------------------------
+# 6. HOME AND HEALTH ROUTES
 # --------------------------------
 
 @app.get("/")
@@ -203,11 +257,24 @@ def home():
 @app.get("/health")
 def health():
 
-    return {"status": "ok"}
+    try:
+        with engine.connect() as connection:
+            connection.execute(text("SELECT 1"))
+
+        return {
+            "status": "ok",
+            "database": "connected"
+        }
+
+    except Exception:
+        raise HTTPException(
+            status_code=503,
+            detail="Database connection failed"
+        )
 
 
 # --------------------------------
-# 6. GET DROPDOWN OPTIONS
+# 7. GET DROPDOWN OPTIONS
 # --------------------------------
 
 @app.get("/api/options")
@@ -222,38 +289,21 @@ def get_options():
 
 
 # --------------------------------
-# 7. ADD PATIENT
+# 8. ADD PATIENT
 # --------------------------------
 
 @app.post("/api/patients")
 def add_patient(patient: Patient):
 
-    connection = get_connection()
+    patient_data = patient.model_dump()
 
-    cursor = connection.execute("""
+    with engine.begin() as connection:
 
-        INSERT INTO patients
-        (name, age, gender, ward, department,
-         doctor, admission_date, status)
+        result = connection.execute(
+            insert(patients).values(**patient_data)
+        )
 
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-
-    """, (
-        patient.name,
-        patient.age,
-        patient.gender,
-        patient.ward,
-        patient.department,
-        patient.doctor,
-        patient.admission_date.isoformat(),
-        patient.status
-    ))
-
-    connection.commit()
-
-    patient_id = cursor.lastrowid
-
-    connection.close()
+        patient_id = result.inserted_primary_key[0]
 
     return {
         "message": "Patient added successfully",
@@ -262,158 +312,122 @@ def add_patient(patient: Patient):
 
 
 # --------------------------------
-# 8. VIEW ALL PATIENTS
+# 9. VIEW ALL PATIENTS
 # --------------------------------
 
 @app.get("/api/patients")
 def get_patients(
-
     search: Optional[str] = None,
     ward: Optional[str] = None,
     department: Optional[str] = None,
     doctor: Optional[str] = None
-
 ):
 
-    connection = get_connection()
-
-    query = "SELECT * FROM patients WHERE 1=1"
-
-    parameters = []
+    query = select(patients)
 
     if search:
-        query += " AND LOWER(name) LIKE ?"
-        parameters.append(f"%{search.lower()}%")
+        query = query.where(
+            patients.c.name.ilike(f"%{search}%")
+        )
 
     if ward:
-        query += " AND ward = ?"
-        parameters.append(ward)
+        query = query.where(patients.c.ward == ward)
 
     if department:
-        query += " AND department = ?"
-        parameters.append(department)
+        query = query.where(
+            patients.c.department == department
+        )
 
     if doctor:
-        query += " AND doctor = ?"
-        parameters.append(doctor)
+        query = query.where(patients.c.doctor == doctor)
 
-    query += " ORDER BY id DESC"
+    query = query.order_by(patients.c.id.desc())
 
-    rows = connection.execute(
-        query, parameters
-    ).fetchall()
+    with engine.connect() as connection:
+        rows = connection.execute(query).mappings().all()
 
-    connection.close()
-
-    return [dict(row) for row in rows]
+    return [serialize_patient(row) for row in rows]
 
 
 # --------------------------------
-# 9. EDIT PATIENT
+# 10. EDIT PATIENT
 # --------------------------------
 
 @app.put("/api/patients/{patient_id}")
 def update_patient(patient_id: int, patient: Patient):
 
-    connection = get_connection()
+    with engine.begin() as connection:
 
-    existing = connection.execute(
-        "SELECT id FROM patients WHERE id = ?",
-        (patient_id,)
-    ).fetchone()
+        existing = connection.execute(
+            select(patients.c.id).where(
+                patients.c.id == patient_id
+            )
+        ).first()
 
-    if not existing:
-        connection.close()
-        raise HTTPException(
-            status_code=404,
-            detail="Patient not found"
+        if not existing:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found"
+            )
+
+        connection.execute(
+            update(patients)
+            .where(patients.c.id == patient_id)
+            .values(**patient.model_dump())
         )
 
-    connection.execute("""
-
-        UPDATE patients SET
-
-        name = ?,
-        age = ?,
-        gender = ?,
-        ward = ?,
-        department = ?,
-        doctor = ?,
-        admission_date = ?,
-        status = ?
-
-        WHERE id = ?
-
-    """, (
-        patient.name,
-        patient.age,
-        patient.gender,
-        patient.ward,
-        patient.department,
-        patient.doctor,
-        patient.admission_date.isoformat(),
-        patient.status,
-        patient_id
-    ))
-
-    connection.commit()
-    connection.close()
-
-    return {"message": "Patient updated successfully"}
+    return {
+        "message": "Patient updated successfully"
+    }
 
 
 # --------------------------------
-# 10. DISCHARGE PATIENT
+# 11. DISCHARGE PATIENT
 # --------------------------------
 
 @app.patch("/api/patients/{patient_id}/discharge")
 def discharge_patient(patient_id: int):
 
-    connection = get_connection()
+    with engine.begin() as connection:
 
-    cursor = connection.execute("""
-
-        UPDATE patients
-        SET status = 'Discharged'
-        WHERE id = ?
-
-    """, (patient_id,))
-
-    connection.commit()
-    connection.close()
-
-    if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Patient not found"
+        result = connection.execute(
+            update(patients)
+            .where(patients.c.id == patient_id)
+            .values(status="Discharged")
         )
 
-    return {"message": "Patient discharged successfully"}
+        if result.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found"
+            )
+
+    return {
+        "message": "Patient discharged successfully"
+    }
 
 
 # --------------------------------
-# 11. DELETE PATIENT
+# 12. DELETE PATIENT
 # --------------------------------
 
 @app.delete("/api/patients/{patient_id}")
 def delete_patient(patient_id: int):
 
-    connection = get_connection()
+    with engine.begin() as connection:
 
-    cursor = connection.execute("""
-
-        DELETE FROM patients
-        WHERE id = ?
-
-    """, (patient_id,))
-
-    connection.commit()
-    connection.close()
-
-    if cursor.rowcount == 0:
-        raise HTTPException(
-            status_code=404,
-            detail="Patient not found"
+        result = connection.execute(
+            delete(patients).where(
+                patients.c.id == patient_id
+            )
         )
 
-    return {"message": "Patient deleted successfully"}
+        if result.rowcount == 0:
+            raise HTTPException(
+                status_code=404,
+                detail="Patient not found"
+            )
+
+    return {
+        "message": "Patient deleted successfully"
+    }
