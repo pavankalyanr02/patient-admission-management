@@ -1,0 +1,20 @@
+
+# Python
+backend/venv/
+backend/__pycache__/
+*.pyc
+
+# Local database
+backend/patients.db
+
+# Node
+frontend/node_modules/
+frontend/dist/
+
+# Environment variables
+.env
+.env.*
+
+# Editor and OS
+.vscode/
+.DS_Store
